@@ -31,12 +31,17 @@
 #include <openssl/err.h>
 
 
+/* On connect, we'll often get FIN/RST errors. When this
+ * happens, we want to retry the connection a few times */
+int g_connect_retries = 4;
+
 /*
  * GLOBALS
  */
+int g_is_iso_confirmed = 0; /* Whether we got an ISO TPKT confimration */
 char g_targetaddr[256];
 char g_targetport[8];
-int g_scan_timeout = 10;
+int g_scan_timeout = 20;
 #ifdef WITH_SCARD
 #define STREAM_COUNT 8
 #else
@@ -85,7 +90,7 @@ tcp_can_receive(int sck, int millis)
 #ifndef WIN32
     if (sck <= 0 || FD_SETSIZE <= sck) {
         STATUS(0, "SELECT FAILURE %d\n", sck);
-        RESULT("UNKNOWN - connection terminated\n");
+        RESULT("UNKNOWN - programming error - connection terminated\n");
         exit(1);
     }
 #endif
@@ -198,6 +203,40 @@ tcp_send(STREAM s)
 #endif
 }
 
+/**
+ * Return an SSL error string.
+ */
+static char *
+my_ssl_error_string(void)
+{ 
+    size_t length;
+    char *buf;
+    char *ptr = NULL;
+    BIO *bio;
+    
+    /* Create an SSL I/O stream to use */
+    bio = BIO_new(BIO_s_mem());
+
+    /* Format the most recent error (stored in the SSL 
+     * thread-local data structures) */
+    ERR_print_errors(bio);
+
+    /* Get a pointer to the BIO's internal buffer, as
+     * as well as the current length */
+    length = BIO_get_mem_data(bio, &ptr);
+
+    /* Create a copy of error message, using our own
+     * memory allocation routines */
+    buf = malloc(length + 1);
+    if (buf)
+        memcpy(buf, ptr, length);
+
+    /* Now free SSL's I/O stream */
+    BIO_free (bio);
+
+    return buf;
+}
+
 /* Receive a message on the TCP layer */
 STREAM
 tcp_recv(STREAM s, uint32 length)
@@ -237,7 +276,7 @@ tcp_recv(STREAM s, uint32 length)
 
 	while (length > 0)
 	{
-        static size_t total_data_received = 0;
+        static size_t g_total_data_received = 0;
         static time_t timeof_last_receive = 0;
         
         if (timeof_last_receive == 0)
@@ -286,12 +325,12 @@ tcp_recv(STREAM s, uint32 length)
 #endif
                 
                 /* Look for full TCP window on the other side */
-                if (total_data_received == 0 && unsent_count > 0) {
-                    RESULT("UNKNOWN - zero TCP window on connect\n");
+                if (g_total_data_received == 0 && unsent_count > 0) {
+                    RESULT("UNKNOWN - no connection - full window\n");
                 } else if (unsent_count) {
-                    RESULT("UNKNOWN - zero TCP window\n");
+                    RESULT("UNKNOWN - RDP protocol error - send timeout\n");
                 } else {
-                    RESULT("UNKNOWN - receive timeout\n");
+                    RESULT("UNKNOWN - RDP protocol error - receive timeout\n");
                 }
             }
         }
@@ -316,13 +355,21 @@ tcp_recv(STREAM s, uint32 length)
 				if (SSL_get_shutdown(g_ssl) & SSL_RECEIVED_SHUTDOWN)
 				{
 					STATUS(0, "Remote peer initiated ssl shutdown.\n");
-                    RESULT("UNKNOWN - network error\n");
+                    RESULT("UNKNOWN - SSL protocol error - network error\n");
                     return NULL;
 				}
-
-				ERR_print_errors_fp(stdout);
-				g_network_error = True;
-				return NULL;
+                else
+                {
+                    //ERR_print_errors_fp(stdout);
+				
+                    /* Some unknown internal error happened within SSL.
+                     * Therefore, we need to print this as a result */
+                    char *err_msg = my_ssl_error_string();
+                    RESULT("UNKNOWN - SSL protocol error - %s\n", err_msg);
+                    free(err_msg);
+    				g_network_error = True;
+	    			return NULL;
+                }
 			}
 
 			if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE)
@@ -332,7 +379,7 @@ tcp_recv(STREAM s, uint32 length)
 			else if (ssl_err != SSL_ERROR_NONE)
 			{
 				STATUS(0, "SSL_read: %d (%s)\n", ssl_err, $strerror($errno));
-                RESULT("UNKNOWN - network error\n");
+                RESULT("UNKNOWN - SSL - network error\n");
 				g_network_error = True;
 				return NULL;
 			}
@@ -349,20 +396,26 @@ tcp_recv(STREAM s, uint32 length)
                         rcvd = 0;
                         break;
                     case $ECONNRESET:
-                        if (total_data_received)
-                            RESULT("UNKNOWN - connection reset on connect\n");
-                        else
-                            RESULT("UNKNOWN - connection reset by peer\n");
+                        if (g_total_data_received == 0) {
+                            if (g_connect_retries <= 1) {
+                                RESULT("UNKNOWN - no connection - connection closed (RST)\n");
+                            } else {
+                                $sleep(5);
+                                g_connect_retries--;
+                                return NULL;
+                            }
+                        } else
+                            RESULT("UNKNOWN - RDP protocol error - connection reset by peer\n");
                         break;
                     case $ECONNABORTED:
                         /* This happens on Windows when the TCP window is full
                          * on connect. */
                         STATUS(1, "connection aborted\n");
-                        RESULT("UNKNOWN - connection aborted\n");
+                        RESULT("UNKNOWN - RDP protocol error - connection aborted\n");
                         break;
                     default:
                         STATUS(1, "[-] recv: %s\n", $strerror($errno));
-                        RESULT("UNKNOWN - error: (%d) %s\n", (int)$errno, $strerror($errno));
+                        RESULT("UNKNOWN - RDP protocol error - (%d) %s\n", (int)$errno, $strerror($errno));
                         g_network_error = True;
                         return NULL;
                 }
@@ -370,7 +423,15 @@ tcp_recv(STREAM s, uint32 length)
 			else if (rcvd == 0)
 			{
 				STATUS(1, "[-] connection closed (TCP FIN)\n");
-                RESULT("UNKNOWN - FIN received\n");
+                if (g_is_iso_confirmed) {
+                    RESULT("UNKNOWN - RDP protocol error - connection closed (FIN)\n");
+                } else if (g_connect_retries <= 1) {
+                    RESULT("UNKNOWN - no connection - connection closed (FIN)\n");
+                } else {
+                    /* Loop around again and retry the connection again a few times */
+                    $sleep(5);
+                    g_connect_retries--;
+                }
 				return NULL;
 			}
 		}
@@ -381,7 +442,7 @@ tcp_recv(STREAM s, uint32 length)
         /* Mark the total amount we've seen on this connection, mostly
          * used to detect when things have broken */
         if (rcvd) {
-            total_data_received += rcvd;
+            g_total_data_received += rcvd;
             timeof_last_receive = time(0);
         }
 	}
@@ -450,23 +511,47 @@ tcp_tls_connect(void)
 		goto fail;
 	}
 
+    /* At this point, we are going to hand off control to OpenSSL
+     * for them to establish the connection */
     timeof_ssl_start = time(0);
 	do
 	{
 		err = SSL_connect(g_ssl);
         if (timeof_ssl_start + g_scan_timeout < time(0)) {
-            RESULT("UNKNOWN - SSL connect timeout\n");
+            RESULT("UNKNOWN - SSL protocol error - connect timeout\n");
             break;
         }
 	}
 	while (SSL_get_error(g_ssl, err) == SSL_ERROR_WANT_READ);
-
 	if (err < 0)
 	{
-		ERR_print_errors_fp(stdout);
+        //ERR_print_errors_fp(stdout);
+				
+        /* Some unknown internal error happened within SSL.
+            * Therefore, we need to print this as a result */
+        char *err_msg = my_ssl_error_string();
+        RESULT("UNKNOWN - SSL protocol error - %s\n", err_msg);
+        free(err_msg);
 		goto fail;
 	}
 
+    /* At this point, we should have an established SSL connection.
+     * Therefore, at this point, we are going to log the connection
+     * information in order to fingerpint the opposing side */
+    {
+        X509 *cert = SSL_get_peer_certificate(g_ssl);
+        if (cert == NULL) {
+            STATUS(0, "SSL - can't get certificate\n");
+        } else {
+            char *name = X509_NAME_oneline(X509_get_subject_name(cert), NULL, 0);
+            if (name == NULL) {
+                STATUS(0, "SSL - can't get certificate subject name\n");
+            } else {
+                STATUS(1, "subject = %s\n", name);
+                OPENSSL_free(name);
+            }
+        }
+    }
 	return True;
 
       fail:
@@ -565,7 +650,7 @@ sockets_connect(const char *target, unsigned port)
     if (err)
     {
         STATUS(0, "[-] getaddrinfo() failed: %s\n", gai_strerror(err));
-        RESULT("UNKNOWN - name resolution failed\n");
+        RESULT("UNKNOWN - no connection - DNS name resolution failed\n");
         return -1;
     }
     
@@ -625,7 +710,7 @@ sockets_connect(const char *target, unsigned port)
                      * not a SYN-ACK or a RST, then don't print anything.
                      * When scanning large ranges, this is the norm */
                     if (!g_result_quiet)
-                        RESULT("UNKNOWN - connect timeout\n");
+                        RESULT("UNKNOWN - no connection - timeout\n");
                     exit(0);
                     $close(fd);
                     fd = -1;
@@ -643,16 +728,32 @@ sockets_connect(const char *target, unsigned port)
                 } else if (errcode != 0) {
                     $close(fd);
                     fd = -1;
-                    switch ($errno) {
+                    switch (errcode) {
                         case $EINTR:
                         case $ETIMEDOUT:
                             STATUS(1, "[-] connect time out\n");
+                            RESULT("UNKNOWN - no connection - timeout\n");
                             break;
                         case $ECONNREFUSED:
                             STATUS(1, "[-] connect refused\n");
+                            RESULT("UNKNOWN - no connection - refused (RST)\n");
+                            break;
+                        case $ECONNRESET:
+                            STATUS(1, "[-] connect reset\n");
+                            RESULT("UNKNOWN - no connection - connection closed (RST)\n");
+                            break;
+                        case $ENETUNREACH:
+                            STATUS(1, "[-] connect ICMP net unreachable\n");
+                            RESULT("UNKNOWN - no connection - network unreachable (ICMP error)\n");
+                            break;
+                        case $EHOSTUNREACH:
+                            STATUS(1, "[-] connect ICMP host unreachable\n");
+                            RESULT("UNKNOWN - no connection - host unreachable (ICMP error)\n");
                             break;
                         default:
-                            STATUS(1, "[-] connect failed: %s (%d) [%d]\n", $strerror($errno), $errno, fd);
+                            STATUS(1, "[-] connect failed: %s (%d) [%d]\n", $strerror(errcode), errcode, fd);
+                            RESULT("UNKNOWN - no connection - failed: %s\n", $strerror(errcode));
+                            break;
                     }
                 }
             }
@@ -666,13 +767,13 @@ sockets_connect(const char *target, unsigned port)
         switch ($errno) {
             case $EINTR:
             case $ETIMEDOUT:
-                STATUS(1, "[-] time out\n");
+                STATUS(1, "[-] not connection - time out\n");
                 break;
             case $ECONNREFUSED:
-                STATUS(1, "[-] connect refused\n");
+                STATUS(1, "[-] no connection - refused (RST)\n");
                 break;
             default:
-                STATUS(1, "[-] connect failed: %s (%d) [%d]\n", $strerror($errno), $errno, fd);
+                STATUS(1, "[-] no connection - %s\n", $strerror($errno));
         }
         $close(fd);
         fd = -1;
@@ -693,7 +794,8 @@ sockets_connect(const char *target, unsigned port)
                 RESULT("UNKNOWN - connect refused\n");
                 break;
             default:
-                RESULT("UNKNOWN - connect failed %d\n", $errno);
+                RESULT("UNKNOWN - connect failed: %s (%d) [%d]\n", $strerror($errno), $errno, fd);
+                //RESULT("UNKNOWN - connect failed %d\n", $errno);
         }
         return -1;
     }
