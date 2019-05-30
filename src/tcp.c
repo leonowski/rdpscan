@@ -24,7 +24,9 @@
 #include "util-xmalloc.h"
 #include "util-log.h"
 #include "util-time.h"
+#include <ctype.h>
 #include <string.h>
+
 
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
@@ -50,7 +52,7 @@ int g_scan_timeout = 20;
 static RD_BOOL g_ssl_initialized = False;
 static SSL *g_ssl = NULL;
 static SSL_CTX *g_ssl_ctx = NULL;
-static int g_sock;
+int g_sock;
 static RD_BOOL g_run_ui = False;
 static struct stream g_in;
 static struct stream g_out[STREAM_COUNT];
@@ -191,6 +193,7 @@ tcp_send(STREAM s)
 #endif
 
 					error("send: %s\n", $strerror($errno));
+                    RESULT("UNKNOWN - RDP protocol error - connection reset\n");
 					g_network_error = True;
 					return;
 				}
@@ -230,6 +233,21 @@ my_ssl_error_string(void)
     buf = malloc(length + 1);
     if (buf)
         memcpy(buf, ptr, length);
+    while (length && isdigit(*buf)) {
+        memmove(buf, buf+1, length);
+        length--;
+    }
+    if (length > 7 && memcmp(buf, ":error:", 7) == 0) {
+        memmove(buf, buf+7, length - 6);
+        length -= 7;
+    }
+    while (length && isxdigit(*buf)) {
+        memmove(buf, buf+1, length);
+        length--;
+    }
+    if (length && *buf == ':')
+        memmove(buf, buf+1, length--);
+    
 
     /* Now free SSL's I/O stream */
     BIO_free (bio);
@@ -281,7 +299,7 @@ tcp_recv(STREAM s, uint32 length)
         
         if (timeof_last_receive == 0)
             timeof_last_receive = time(0);
-        
+   
         /* Use select to wait for incoming data */
         if (!tcp_can_receive(g_sock, 1000))
         {
@@ -289,7 +307,6 @@ tcp_recv(STREAM s, uint32 length)
             extern time_t g_first_check;
             extern void mst120_check(int);
             
-            printf("%lu\n", g_first_check);
             if (g_first_check && g_first_check + MST120_TIMEOUT < time(0)) {
                 /* CVE-2019-0708
                  * We'll check this when recieving 'orders' from the other side,
@@ -516,6 +533,7 @@ tcp_tls_connect(void)
     timeof_ssl_start = time(0);
 	do
 	{
+        STATUS(1, "STARTTLS starting TLS ...\n");
 		err = SSL_connect(g_ssl);
         if (timeof_ssl_start + g_scan_timeout < time(0)) {
             RESULT("UNKNOWN - SSL protocol error - connect timeout\n");
