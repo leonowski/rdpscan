@@ -2,8 +2,8 @@ FROM debian:latest as builder
 
 COPY . /app
 WORKDIR /app
-RUN apt-get update && apt-get -y upgrade && apt-get install -y libssl-dev build-essential && gcc *.c -lssl -lcrypto -o rdpscan && make
+RUN apt-get update && apt-get -y upgrade && apt-get install -y libssl-dev build-essential && gcc *.c -lssl -lcrypto -o rdpscan && make -C ./src
 
 FROM gcr.io/distroless/cc
-COPY --from=builder /app/rdpscan /app/rdpscan
+COPY --from=builder /app/src/rdpscan /app/rdpscan
 ENTRYPOINT ["/app/rdpscan"]
