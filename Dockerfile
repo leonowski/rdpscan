@@ -5,5 +5,5 @@ WORKDIR /app
 RUN apt-get update && apt-get -y upgrade && apt-get install -y libssl-dev build-essential && gcc src/*.c -lssl -lcrypto -o rdpscan
 
 FROM gcr.io/distroless/cc
-COPY --from=builder /app/src/rdpscan /app/rdpscan
+COPY --from=builder /app/rdpscan /app/rdpscan
 ENTRYPOINT ["/app/rdpscan"]
