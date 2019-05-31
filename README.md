@@ -1,7 +1,11 @@
-[![Windows download](/badges/binary-windows.svg)](https://github.com/robertdavidgraham/rdpscan/files/3240237/rdpscan-windows.zip)
-[![macOS download](/badges/binary-macos.svg)](https://github.com/robertdavidgraham/rdpscan/files/3240236/rdpscan-macos.zip)
-[![Linux download](/badges/source-linux.svg)](https://github.com/robertdavidgraham/rdpscan/archive/v0.0.2.zip)
-[![Follow](/badges/erratarob.svg)](https://twitter.com/intent/follow?screen_name=erratarob)
+# Forked from https://github.com/robertdavidgraham/rdpscan
+
+This fork was made for the purpose of Autobuilding on github.  Available at:  https://hub.docker.com/r/leonowski/rdpscan
+
+(https://github.com/robertdavidgraham/rdpscan/files/3240237/rdpscan-windows.zip)
+(https://github.com/robertdavidgraham/rdpscan/files/3240236/rdpscan-macos.zip)
+(https://github.com/robertdavidgraham/rdpscan/archive/v0.0.2.zip)
+(https://twitter.com/intent/follow?screen_name=erratarob)
 
 # rdpscan for CVE-2019-0708 bluekeep vuln
 
